@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"log"
 	"sync"
 	"time"
 )
@@ -25,8 +26,6 @@ import "6824_2018/labrpc"
 
 // import "bytes"
 // import "labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,14 +49,20 @@ const (
 	CANDIDATE
 	LEADER
 )
+
 //
 // A Go object implementing a single Raft peer.
 //
+type entry struct {
+	command interface{}
+	term    int
+}
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
+
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -67,10 +72,108 @@ type Raft struct {
 	state       int // 0 is follower | 1 is candidate | 2 is leader
 	timeout     int
 
-	heartbeat       chan HeatbeatMeta
-	cancelSelection chan struct{}
+	//2B
+	logs []entry
+	// index of highest log entry known to be committed
+	commitIndex int
+	// index of highest log entry applied to state machine
+	lastApplied int
+
+	// for each server, index of the next log entry  to send to that server
+	// (initialized to leader last log index + 1)
+	nextIndex []int
+	// for each server, index of highest log entry  known to be replicated on server
+	// (initialized to 0, increases monotonically)
+	matchIndex []int
+	//
+	syncController  syncGroutineController
+	// the rwmu of commitIndex and logs
+	rwmu  sync.RWMutex
+
+	heartbeat              chan HeatbeatMeta
+	syncStart chan struct{}
+	cancelSelection        chan struct{}
 	startUpCancelSelection chan struct{}
-	becomeLeader    chan bool
+	becomeLeader           chan bool
+}
+type syncGroutineController struct {
+	mu  sync.Mutex
+	syncGoroutine []bool
+	cancelSyncGoroutine [] chan struct{}
+}
+
+func (s *syncGroutineController) init(serverNum int) {
+	s.syncGoroutine = make([]bool,serverNum)
+	s.cancelSyncGoroutine = make([]chan struct{},serverNum)
+	panic("implement me")
+}
+
+func (s *syncGroutineController) isStart(server int) bool {
+	return s.syncGoroutine[server]
+}
+
+func (s *syncGroutineController) start(server int)  {
+	s.syncGoroutine[server] = true
+}
+
+func (s *syncGroutineController) addCancelChannel(server int, cancel chan struct{}) {
+	s.mu.Lock()
+	defer  s.mu.Unlock()
+	s.cancelSyncGoroutine[server] = cancel
+}
+
+func (s *syncGroutineController) removeCancelChannel(server int) {
+	s.mu.Lock()
+	defer  s.mu.Unlock()
+	s.cancelSyncGoroutine[server] = nil
+}
+// 防止 start 和 addCancelChannel 被分开运行。
+// 调用 cancel  之前，状态要改变为 非 leader 。
+func (s *syncGroutineController) cancel() {
+	s.mu.Lock()
+	defer  s.mu.Unlock()
+	for i:=0; i<len(s.cancelSyncGoroutine); i++ {
+		if s.syncGoroutine[i] {
+			// 立即取消
+			s.syncGoroutine[i] = false
+			if s.cancelSyncGoroutine[i] != nil {
+				s.cancelSyncGoroutine[i] <- struct{}{}
+				s.cancelSyncGoroutine[i] = nil
+
+			}else{
+				s.mu.Unlock()
+				// unlock it ,  wait 50 ms
+				// TODO Check it
+				time.Sleep(50*time.Millisecond)
+				s.mu.Lock()
+				// do again
+				if s.cancelSyncGoroutine[i] != nil {
+					s.cancelSyncGoroutine[i] <- struct{}{}
+					s.cancelSyncGoroutine[i] = nil
+
+				}else{
+					log.Fatalf("s.cancelSyncGoroutine[%d] aren't excpeted set",i)
+				}
+			}
+
+		}
+
+	}
+}
+
+type syncGroutineControllerIn interface {
+	// init SyncGoroutine and cancelSyncGoroutine and mu
+	init(serverNum int)
+	//  检查该 server 的 Goroutine 是否启动
+	isStart(server int) bool
+	// start sync goroutine for server
+	start(server int) bool
+	// add cancel channel for server
+	addCancelChannel(server int,cancel chan struct{})
+	// remove  cancel channel for server
+	removeCancelChannel(server int)
+	// cancel all goroutine and rteset
+	cancel()
 }
 
 func (rf *Raft) ToFollower(term int, votedFor int) {
@@ -95,6 +198,17 @@ func (rf *Raft) ToLeader() {
 	rf.state = LEADER
 }
 
+func (rf *Raft) isLogSatisfy() bool {
+	rf.rwmu.RLock()
+	defer  rf.rwmu.RUnlock()
+	for _, v := range rf.matchIndex {
+
+		if rf.commitIndex != v {
+			return false
+		}
+	}
+	return true
+}
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -157,19 +271,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term        int
-	CandidateId int
-	//LastLogIndex int
-	//LastLogTerm int
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -184,6 +295,14 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
+	// index of log entry immediately preceding new ones
+	prevLogIndex int
+	// term of preLogIndex entry
+	prevLogTerm int
+	// log entries to store (empty for heartbeat )
+	entries []entry
+	// leader's commitIndex
+	leaderCommit int
 }
 type AppendEntriesReply struct {
 	Term    int
@@ -197,7 +316,8 @@ type HeatbeatMeta struct {
 
 //
 // example RequestVote RPC handler.
-//
+// TODO:2B
+// 添加日志判断，在考虑 index 时如何返回信息
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	DPrintf3("Server %d(%s,Term:%d) Accept Request Vote,args.Term:%d,args.CandidateId:%d", rf.me, rf.status(), rf.currentTerm, args.Term, args.CandidateId)
@@ -215,9 +335,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		if rf.state == CANDIDATE {
 
-			DPrintf5("Server %d(%s) try cancel startUp selection", rf.me,rf.status())
+			DPrintf5("Server %d(%s) try cancel startUp selection", rf.me, rf.status())
 			rf.startUpCancelSelection <- struct{}{}
-			DPrintf5("Server %d(%s) success  cancel startUp selection ", rf.me,rf.status())
+			DPrintf5("Server %d(%s) success  cancel startUp selection ", rf.me, rf.status())
 
 		}
 		rf.heartbeat <- HeatbeatMeta{Term: args.Term, VotedFor: args.CandidateId, TmpFlag: "RequestVote"}
@@ -237,6 +357,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	return
 }
+
+// TODO 根据注入的日志信息同步日志
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	DPrintf("Server %d Accept Append Entry", rf.me)
 
@@ -255,9 +377,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		DPrintf("Server %d:Append Entry Deal Success, Arg:%v", rf.me, args)
 		if rf.state == CANDIDATE {
-			DPrintf5("Server %d(%s) try cancel startUp selection", rf.me,rf.status())
+			DPrintf5("Server %d(%s) try cancel startUp selection", rf.me, rf.status())
 			rf.startUpCancelSelection <- struct{}{}
-			DPrintf5("Server %d(%s) success  cancel startUp selection ", rf.me,rf.status())
+			DPrintf5("Server %d(%s) success  cancel startUp selection ", rf.me, rf.status())
 		}
 		rf.heartbeat <- HeatbeatMeta{Term: args.Term, VotedFor: -1, TmpFlag: "AppendEntries"}
 		reply.Term = -1
@@ -302,7 +424,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -323,6 +444,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
+	rf.mu.Lock()
+	if rf.state == LEADER {
+		rf.rwmu.Lock()
+		rf.commitIndex = rf.commitIndex + 1
+		rf.logs = append(rf.logs, entry{command: command, term: rf.currentTerm})
+		rf.rwmu.Unlock()
+		term = rf.currentTerm
+		index = rf.commitIndex
+	} else {
+		isLeader = false
+	}
+	rf.mu.Unlock()
+	// new log start sync
+	rf.syncStart <- struct{}{}
 
 	return index, term, isLeader
 }
@@ -348,6 +483,58 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+// 同步状态机
+func (rf *Raft) sync() {
+	for   {
+		select {
+			case <- rf.syncStart:
+				// 针对每一个 server 都启动一次 goroutine 进行同步，但每次只能启动一个，除非日志同步成功，或者获取取消信号，要不然不会被取消
+				// 在 cancel 之后被启动， leader 不满足 leader 状态不会创建新的 goroutine
+
+				for i:=0; i< len(rf.peers); i++ {
+					// 没有启动过 syncGoroutine，并且日志不同，并且不是本身
+					rf.rwmu.RLock()
+					if  rf.state == LEADER && i != rf.me && rf.commitIndex > rf.matchIndex[i] && !rf.syncController.isStart(i)  {
+						rf.rwmu.RUnlock()
+						rf.syncController.start(i)
+						go func(i int) {
+							cancel := make(chan struct{})
+							unSat := make(chan struct{}) // 说明没有日志没有同步成功
+							unSat <- struct{}{}
+							rf.syncController.addCancelChannel(i,cancel)
+							for {
+								select {
+								case <- cancel:
+										// 防止 cancel 函数的提前移除
+										rf.syncController.removeCancelChannel(i)
+										return
+								case <- unSat:
+										rf.rwmu.RLock()
+										// 添加个读写锁
+										if rf.commitIndex == rf.matchIndex[i]{
+											rf.rwmu.RUnlock()
+											return
+										}else{
+											rf.rwmu.RUnlock()
+											unSat <- struct{}{}
+										}
+								}
+							}
+
+
+
+
+						}(i)
+					}else{
+						rf.rwmu.RUnlock()
+					}
+
+				}
+
+
+		}
+	}
+}
 func (rf *Raft) startUp() {
 
 	timer := time.NewTimer(time.Duration(rf.timeout) * time.Millisecond)
@@ -357,10 +544,12 @@ func (rf *Raft) startUp() {
 		case <-timer.C:
 			if rf.state == LEADER {
 				DPrintf4("Server %d(%s) make heat beats", rf.me, rf.status())
+
 				go rf.makeHeatBeat()
 				timer.Reset(150 * time.Millisecond)
 			} else if rf.state == CANDIDATE {
 				DPrintf4("Server %d(%s) make vote", rf.me, rf.status())
+
 				go rf.makeRequestVote()
 
 				select {
@@ -383,7 +572,7 @@ func (rf *Raft) startUp() {
 						DPrintf3("Election End, The server %d fail become leader ", rf.me)
 					}
 					timer.Reset(time.Duration(0) * time.Millisecond)
-				case <- rf.startUpCancelSelection:
+				case <-rf.startUpCancelSelection:
 					rf.cancelSelection <- struct{}{}
 					// don't need reset timer , for rf.heartbeat is coming
 				}
@@ -430,6 +619,8 @@ func (rf *Raft) startUp() {
 		}
 	*/
 }
+
+// TODO Snyc Log according match[]
 func (rf *Raft) makeHeatBeat() {
 	replyChannel := make(chan *AppendEntriesReply, 10)
 	//CancelStatistics := make(chan struct{})
@@ -600,7 +791,7 @@ func (rf *Raft) makeRequestVote() {
 			case <-rf.cancelSelection:
 				// Ask End Selection
 				wg2.Done()
-				DPrintf3("Service %d(%s) Election Statistics Goroutine End，For time out",rf.me,rf.status())
+				DPrintf3("Service %d(%s) Election Statistics Goroutine End，For time out", rf.me, rf.status())
 				return
 				//case <-funcCancelSelect:
 				//	// Election finish End
@@ -645,12 +836,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.becomeLeader = make(chan bool)
 	rf.cancelSelection = make(chan struct{})
 	rf.startUpCancelSelection = make(chan struct{})
-
+	rf.syncStart  = make(chan struct{})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.startUp()
-
 
 	return rf
 }
