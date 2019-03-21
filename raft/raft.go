@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"github.com/sirupsen/logrus"
 	"log"
 	"sync"
 	"time"
@@ -75,8 +76,12 @@ type Raft struct {
 	//2B
 	logs []entry
 	// index of highest log entry known to be committed
+	// initialized to 0, increases  monotonically
+	// 是 Commited 还是 applited 是已经过半提交的意思？
 	commitIndex int
 	// index of highest log entry applied to state machine
+	// initialized to 0, increases  monotonically
+
 	lastApplied int
 
 	// for each server, index of the next log entry  to send to that server
@@ -109,11 +114,21 @@ func (s *syncGroutineController) init(serverNum int) {
 }
 
 func (s *syncGroutineController) isStart(server int) bool {
+	s.mu.Lock()
+	defer  s.mu.Unlock()
 	return s.syncGoroutine[server]
 }
 
 func (s *syncGroutineController) start(server int)  {
+	s.mu.Lock()
+	defer  s.mu.Unlock()
 	s.syncGoroutine[server] = true
+}
+func (s *syncGroutineController) end(server int)  {
+	s.mu.Lock()
+	defer  s.mu.Unlock()
+	s.syncGoroutine[server] = false
+	s.cancelSyncGoroutine[server] = nil
 }
 
 func (s *syncGroutineController) addCancelChannel(server int, cancel chan struct{}) {
@@ -194,6 +209,13 @@ func (rf *Raft) ToLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.votedFor = rf.me
+
+	for i:=0; i < len(rf.peers) ; i ++ {
+		if i != rf.me {
+			rf.matchIndex[i] = -1
+			rf.nextIndex[i] = len(rf.logs)
+		}
+	}
 
 	rf.state = LEADER
 }
@@ -329,7 +351,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//      并且发送 heartbeat
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.currentTerm < args.Term {
+	// 判断发出请求的 Candidate 的日志，是否优先于当前 Server 的方式
+	// If the logs have last entries with different terms, then
+	// the log with the later term is more up-to-date. If the logs
+	// end with the same term, then whichever log is longer is
+	// more up-to-date.
+	// TODO 在这里被拒绝的请求，是否会因为 AppendEntries 的心跳包被重置成功。
+	// 但是成为 Leader 的 Log 在大部分的 server 中出现。
+	// 只要在实际上被大部分 server  接受的 log，会出现在 leader 之中的。
+	// 如果一个 log 只被少部分同步呢？ 是否会被放弃
+	if rf.currentTerm < args.Term && ( rf.logs[len(rf.logs)].term < args.LastLogTerm || (len(rf.logs) <= args.LastLogIndex && rf.logs[len(rf.logs)].term == args.LastLogTerm )) {
 		DPrintf3("Server %d vote Candidate %d for term get behind", rf.me, args.CandidateId)
 		reply.Term = args.Term
 		reply.VoteGranted = true
@@ -342,7 +373,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		rf.heartbeat <- HeatbeatMeta{Term: args.Term, VotedFor: args.CandidateId, TmpFlag: "RequestVote"}
 		return
-	} else if rf.currentTerm == args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
+	} else if rf.currentTerm == args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && ( rf.logs[len(rf.logs)].term < args.LastLogTerm || (len(rf.logs) <= args.LastLogIndex && rf.logs[len(rf.logs)].term == args.LastLogTerm )) {
 		//if rf.currentTerm <= args.Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		DPrintf3("Server %d vote Candidate %d", rf.me, args.CandidateId)
 		reply.Term = args.Term
@@ -370,21 +401,70 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//rf.mu.Lock()
 	//defer  rf.mu.Unlock()
 	if rf.currentTerm > args.Term {
-		DPrintf("Server %d:Append Entry Deal Fail", rf.me)
+		DPrintf("Server %d:Append Entry  Fail", rf.me)
 
 		reply.Term = rf.currentTerm
 		reply.Success = false
 	} else {
-		DPrintf("Server %d:Append Entry Deal Success, Arg:%v", rf.me, args)
-		if rf.state == CANDIDATE {
-			DPrintf5("Server %d(%s) try cancel startUp selection", rf.me, rf.status())
-			rf.startUpCancelSelection <- struct{}{}
-			DPrintf5("Server %d(%s) success  cancel startUp selection ", rf.me, rf.status())
+		if len(args.entries) == 0 {
+			DPrintf("Server %d:Append Entry Deal Success, Arg:%v", rf.me, args)
+			if rf.state == CANDIDATE {
+				DPrintf5("Server %d(%s) try cancel startUp selection", rf.me, rf.status())
+				rf.startUpCancelSelection <- struct{}{}
+				DPrintf5("Server %d(%s) success  cancel startUp selection ", rf.me, rf.status())
+			}
+			rf.heartbeat <- HeatbeatMeta{Term: args.Term, VotedFor: -1, TmpFlag: "AppendEntries"}
+			reply.Term = -1
+			reply.Success = true
+		}else{
+
+			// Reply false if log doesn't contain an entry at prevLogIndex whose term matches preLogTerm
+			if len(rf.logs) < args.prevLogIndex || rf.logs[args.prevLogIndex].term != args.Term {
+				reply.Term = rf.currentTerm
+				reply.Success = false
+			}else{
+				// If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+				// Append any new entries not already in the log
+				// 直接 Log 覆盖
+
+				rf.mu.Lock()
+
+				// 预先删除多余的 entries
+				if args.prevLogIndex + len(args.entries) < len(rf.logs) {
+					rf.logs = rf.logs[:args.prevLogIndex+len(args.entries)]
+				}
+
+				j := 0
+				for k:= args.prevLogIndex+1; k < args.prevLogIndex + len(args.entries) ; k++ {
+
+					if k < len(rf.logs) {
+						// 需要进行日志匹配
+						if rf.logs[k].term != args.entries[j].term {
+							// 日志不匹配，删除其后，并且将新的增加到其中
+							rf.logs = append(rf.logs[:k-1],args.entries[j:]...)
+							break
+						}
+					}else{
+						// 全新的 entry， 直接依次添加即可
+						rf.logs = append(rf.logs,args.entries[j:]...)
+						break
+					}
+					j = j + 1
+				}
+
+				rf.commitIndex = func(a int, b int) int {
+					if a > b {
+						return b
+					}else {
+						return a
+					}
+				}(rf.commitIndex,args.leaderCommit)
+
+				rf.mu.Unlock()
+			}
 		}
-		rf.heartbeat <- HeatbeatMeta{Term: args.Term, VotedFor: -1, TmpFlag: "AppendEntries"}
-		reply.Term = -1
-		reply.Success = true
-		rf.GetState()
+
+
 
 	}
 
@@ -488,6 +568,7 @@ func (rf *Raft) sync() {
 	for   {
 		select {
 			case <- rf.syncStart:
+				// 启动的情况有两种，一种是 toleader，一种是有新的 start
 				// 针对每一个 server 都启动一次 goroutine 进行同步，但每次只能启动一个，除非日志同步成功，或者获取取消信号，要不然不会被取消
 				// 在 cancel 之后被启动， leader 不满足 leader 状态不会创建新的 goroutine
 
@@ -509,31 +590,90 @@ func (rf *Raft) sync() {
 										rf.syncController.removeCancelChannel(i)
 										return
 								case <- unSat:
+									    args :=  &AppendEntriesArgs{}
+										rf.rwmu.RLock()
+									    args.Term = rf.currentTerm
+									    args.LeaderId = rf.me
+									    args.leaderCommit = rf.commitIndex
+										// nextIndex 存放的是这一次同步日志开始的位置。
+										// prevLogIndex 在 nextIndex 的前面
+									    args.prevLogIndex = rf.nextIndex[i] - 1
+									    args.entries = make([]entry,len(rf.logs)-rf.nextIndex[i]+1)
+									    copy(args.entries,rf.logs[rf.nextIndex[i]:])
+									    rf.rwmu.RUnlock()
+										reply := &AppendEntriesReply{}
+
+										ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
+
+										if ok {
+											if reply.Success {
+												rf.mu.Lock()
+												// TODO 这样的一次性同步是否正确。
+												rf.nextIndex[i]  = len(rf.logs)
+												rf.matchIndex[i] =  len(rf.logs) - 1
+												rf.mu.Unlock()
+											}else{
+												if reply.Term > rf.currentTerm {
+													// TODO  重置 syncController,并且成为 Follower
+												}else{
+													rf.mu.Lock()
+													rf.nextIndex[i] = rf.nextIndex[i] - 1
+													rf.mu.Unlock()
+												}
+											}
+										}else {
+											logrus.Warnf("Server %d(%s) call AppendEntries(sync) of Server %d Fail ,For timeout", rf.me, rf.status(),i )
+										}
 										rf.rwmu.RLock()
 										// 添加个读写锁
-										if rf.commitIndex == rf.matchIndex[i]{
-											rf.rwmu.RUnlock()
-											return
-										}else{
+										if  len(rf.logs) >= rf.nextIndex[i]{
 											rf.rwmu.RUnlock()
 											unSat <- struct{}{}
+										}else{
+											rf.rwmu.RUnlock()
+											rf.syncController.end(i)
+											return
 										}
 								}
 							}
-
-
-
-
 						}(i)
 					}else{
 						rf.rwmu.RUnlock()
 					}
 
 				}
-
-
 		}
 	}
+}
+// 伴随一次心跳，更新 commitIndex
+func (rf * Raft) commitIndexUpdate() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	maxMatchIndex := -1
+
+	// get the max value of rf.matchIndex
+	for k,v := range rf.matchIndex {
+		if v > maxMatchIndex && k!=rf.me {
+			maxMatchIndex = v
+		}
+	}
+
+	// from maxMatchIndex to rf.commitIndex , judge one by one
+	for i:=maxMatchIndex; i>rf.commitIndex; i-- {
+		flag := 1 // leader 一定已经 match 了
+		for j:=0; j<len(rf.peers); j++ {
+			if i >= rf.matchIndex[j] && j != rf.me {
+				flag ++
+			}
+		}
+
+		if float32(flag) / float32(len(rf.peers)) > 0.5 {
+			// i 对应的 log 在 server 占据多数的同步,继续此次 matchIndex 的更新
+			rf.commitIndex = i
+			break
+		}
+	}
+
 }
 func (rf *Raft) startUp() {
 
@@ -546,6 +686,8 @@ func (rf *Raft) startUp() {
 				DPrintf4("Server %d(%s) make heat beats", rf.me, rf.status())
 
 				go rf.makeHeatBeat()
+
+				rf.commitIndexUpdate()
 				timer.Reset(150 * time.Millisecond)
 			} else if rf.state == CANDIDATE {
 				DPrintf4("Server %d(%s) make vote", rf.me, rf.status())
@@ -680,6 +822,7 @@ func (rf *Raft) makeHeatBeat() {
 					if reply.Success {
 						heartbeatSuccess = heartbeatSuccess + 1
 					} else {
+						// TODO 请求失败，如果 Term > currentTerm 的情况， 应该返回成 Follower
 						heartbeatFail = heartbeatFail + 1
 					}
 
@@ -712,27 +855,7 @@ func (rf *Raft) makeRequestVote() {
 			reply := &RequestVoteReply{}
 			wg.Add(1)
 			go func(server int) {
-				//var ok bool
-				//callHook := make(chan struct{})
-				//go func() {
-				//	ok = rf.peers[server].Call("Raft.RequestVote", args, reply)
-				//	callHook <- struct{}{}
-				//}()
-				//
-				//select {
-				//case <-time.After(200 * time.Millisecond):
-				//	wg.Done()
-				//	replyChannel <- nil
-				//	logrus.Warnf("Server %d(%s) call RequestVote of Server %d Fail ,For timeout", rf.me, rf.status(), server)
-				//case <-callHook:
-				//	if ok {
-				//		replyChannel <- reply
-				//	} else {
-				//		DPrintf5("Server %d[%s] call RequestVote of Server %d Fail ,For return fail", rf.me, rf.status(), server)
-				//		replyChannel <- nil
-				//	}
-				//	wg.Done()
-				//}
+
 				ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 				if ok {
 					// TODO
@@ -793,10 +916,6 @@ func (rf *Raft) makeRequestVote() {
 				wg2.Done()
 				DPrintf3("Service %d(%s) Election Statistics Goroutine End，For time out", rf.me, rf.status())
 				return
-				//case <-funcCancelSelect:
-				//	// Election finish End
-				//	DPrintf3("Service %d(%s) Election Statistics Goroutine End",rf.me,rf.status())
-				//	return
 			}
 		}
 	}()
@@ -830,8 +949,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.votedFor = -1
 	rf.currentTerm = 0
+	rf.matchIndex = make([]int,len(rf.peers))
+	rf.nextIndex = make([]int,len(rf.peers))
 	rf.timeout = randInt(200, 300)
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 	DPrintf("Service %d's timeout is %d", rf.me, rf.timeout)
+
 	rf.heartbeat = make(chan HeatbeatMeta)
 	rf.becomeLeader = make(chan bool)
 	rf.cancelSelection = make(chan struct{})
